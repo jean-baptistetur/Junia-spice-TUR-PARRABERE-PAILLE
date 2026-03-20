@@ -1,7 +1,6 @@
 package com.jad.scheduler.model;
 
 import lombok.Getter;
-
 import java.util.ArrayList;
 import java.util.List;
 
@@ -19,6 +18,10 @@ public class MachineSchedule {
     }
 
     public double getTotalLoad() {
-        return orders.stream().mapToDouble(ManufactureOrder::getQuantity).sum();
+        double total = 0.0;
+        for (ManufactureOrder order : orders) {
+            total = total + order.getQuantity();
+        }
+        return total;
     }
 }

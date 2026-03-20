@@ -8,67 +8,76 @@ import com.jad.entity.ProductRecipe;
 import com.jad.entity.RecipeLine;
 import com.jad.scheduler.model.MachineSchedule;
 import com.jad.scheduler.model.ManufactureOrder;
-import com.jad.service.MachineToolService;
 import com.jad.service.OperationTypeService;
 import com.jad.service.ProductRecipeService;
 import com.jad.service.ProductService;
 
 import java.sql.SQLException;
-import java.util.*;
+import java.util.ArrayList;
+import java.util.HashMap;
+import java.util.HashSet;
+import java.util.List;
+import java.util.Map;
+import java.util.Set;
 
 public class SmartMonkeyScheduler {
 
     private final ProductService productService;
     private final ProductRecipeService productRecipeService;
     private final OperationTypeService operationTypeService;
-    private final MachineToolService machineToolService;
 
     private final Map<Integer, MachineSchedule> scheduleMap = new HashMap<>();
     private final Map<Integer, Double> quantityMemo = new HashMap<>();
-    private int orderCounter = 0;
 
     public SmartMonkeyScheduler(DBConnector dbConnector) throws SQLException {
         this.productService = new ProductService(dbConnector);
         this.productRecipeService = new ProductRecipeService(dbConnector);
         this.operationTypeService = new OperationTypeService(dbConnector);
-        this.machineToolService = new MachineToolService(dbConnector);
     }
 
     public List<MachineSchedule> schedule(int idProduct, double quantity) throws SQLException {
         scheduleMap.clear();
         quantityMemo.clear();
-        orderCounter = 0;
-
         accumulateQuantities(idProduct, quantity);
-        Set<Integer> planned = new HashSet<>();
-        planInOrder(idProduct, planned);
-
+        planInOrder(idProduct, new HashSet<>());
         return new ArrayList<>(scheduleMap.values());
     }
 
     private void accumulateQuantities(int idProduct, double quantity) throws SQLException {
         Product product = productService.getById(idProduct);
-        if (product == null || Boolean.TRUE.equals(product.getIsAtomic())) return;
+        if (product == null || Boolean.TRUE.equals(product.getIsAtomic())) {
+            return;
+        }
 
         ProductRecipe recipe = productRecipeService.getByIdProduct(idProduct);
-        if (recipe == null || recipe.getIdProduct() == null) return;
+        if (recipe == null || recipe.getIdProduct() == null) {
+            return;
+        }
 
-        OperationType operationType = operationTypeService.getById(recipe.getIdOperationType());
-        if (operationType == null) return;
+        OperationType op = operationTypeService.getById(recipe.getIdOperationType());
+        if (op == null) {
+            return;
+        }
 
-        double lossRate = operationType.getLossOfQuantity() / 100.0;
-        double grossQuantity = quantity / (1.0 - lossRate);
+        double lossRate = op.getLossOfQuantity() / 100.0;
+        double gross = quantity / (1.0 - lossRate);
 
-        quantityMemo.merge(idProduct, grossQuantity, Double::sum);
+        if (quantityMemo.containsKey(idProduct)) {
+            quantityMemo.put(idProduct, quantityMemo.get(idProduct) + gross);
+        } else {
+            quantityMemo.put(idProduct, gross);
+        }
 
         for (RecipeLine line : recipe.getRecipeLines()) {
-            double componentQty = grossQuantity * (line.getPercentage() / 100.0);
+            double componentQty = gross * (line.getPercentage() / 100.0);
             accumulateQuantities(line.getIdComponent(), componentQty);
         }
     }
 
     private void planInOrder(int idProduct, Set<Integer> planned) throws SQLException {
-        if (planned.contains(idProduct)) return;
+        if (planned.contains(idProduct)) {
+            return;
+        }
 
         Product product = productService.getById(idProduct);
         if (product == null || Boolean.TRUE.equals(product.getIsAtomic())) {
@@ -88,48 +97,60 @@ public class SmartMonkeyScheduler {
 
         planned.add(idProduct);
 
-        OperationType operationType = operationTypeService.getById(recipe.getIdOperationType());
-        if (operationType == null) return;
-
-        double totalQuantity = quantityMemo.getOrDefault(idProduct, 0.0);
-        if (totalQuantity <= 0) return;
-
-        List<MachineTool> machines = operationTypeService.getMachineToolsForOperationTypeId(recipe.getIdOperationType());
-        if (machines.isEmpty()) {
-            System.err.println("[Singe] Aucune machine pour : " + operationType.getLabel());
+        OperationType op = operationTypeService.getById(recipe.getIdOperationType());
+        if (op == null) {
             return;
         }
 
         int nbComponents = recipe.getRecipeLines().size();
-        if (nbComponents < operationType.getMinNbComponents() || nbComponents > operationType.getMaxNbComponents()) {
-            System.err.println("[Singe] Nombre de composants invalide pour : " + operationType.getLabel()
-                    + " (attendu: " + operationType.getMinNbComponents()
-                    + "-" + operationType.getMaxNbComponents()
-                    + ", trouvé: " + nbComponents + ")");
+        if (nbComponents < op.getMinNbComponents() || nbComponents > op.getMaxNbComponents()) {
+            System.err.println("[Singe] Composants invalides pour : " + op.getLabel());
             return;
         }
-        double remaining = totalQuantity;
-        while (remaining > 0) {
-            MachineTool chosen = chooseLeastLoadedMachine(machines);
 
-            double lotQty = Math.min(remaining, chosen.getMaxQuantity());
-            lotQty = Math.max(lotQty, chosen.getMinQuantity());
-            remaining -= lotQty;
-
-            MachineSchedule machineSchedule = scheduleMap.computeIfAbsent(chosen.getId(), MachineSchedule::new);
-            machineSchedule.addOrder(new ManufactureOrder(orderCounter++, idProduct, lotQty));
-
-            System.out.println("[Singe] Planifié : " + product.getLabel()
-                    + " x" + lotQty + " → " + chosen.getLabel());
+        List<MachineTool> machines = operationTypeService.getMachineToolsForOperationTypeId(recipe.getIdOperationType());
+        if (machines.isEmpty()) {
+            System.err.println("[Singe] Aucune machine pour : " + op.getLabel());
+            return;
         }
-    }
 
-    private MachineTool chooseLeastLoadedMachine(List<MachineTool> machines) {
-        return machines.stream()
-                .min(Comparator.comparingDouble(m -> {
-                    MachineSchedule ms = scheduleMap.get(m.getId());
-                    return ms == null ? 0.0 : ms.getTotalLoad();
-                }))
-                .orElse(machines.get(0));
+        double remaining;
+        if (quantityMemo.containsKey(idProduct)) {
+            remaining = quantityMemo.get(idProduct);
+        } else {
+            remaining = 0.0;
+        }
+
+        int localOrder = 0;
+
+        while (remaining > 0) {
+            MachineTool chosen = machines.get(0);
+            double minLoad = Double.MAX_VALUE;
+
+            for (MachineTool m : machines) {
+                double load = 0.0;
+                if (scheduleMap.containsKey(m.getId())) {
+                    load = scheduleMap.get(m.getId()).getTotalLoad();
+                }
+                if (load < minLoad) {
+                    minLoad = load;
+                    chosen = m;
+                }
+            }
+
+            double lot = Math.min(remaining, chosen.getMaxQuantity());
+            if (lot < chosen.getMinQuantity()) {
+                lot = chosen.getMinQuantity();
+            }
+            remaining = remaining - lot;
+
+            if (!scheduleMap.containsKey(chosen.getId())) {
+                scheduleMap.put(chosen.getId(), new MachineSchedule(chosen.getId()));
+            }
+            scheduleMap.get(chosen.getId()).addOrder(new ManufactureOrder(localOrder, idProduct, lot));
+            localOrder = localOrder + 1;
+
+            System.out.println("[Singe] " + product.getLabel() + " x" + lot + " → " + chosen.getLabel());
+        }
     }
 }
